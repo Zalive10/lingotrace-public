@@ -84,11 +84,71 @@ function extractJsonPayload(raw: string): string {
 
 
 function normalizeJsonText(value: string): string {
-  return value
-    .replace(/[“”]/g, '"')
-    .replace(/,\s*([}\]])/g, '$1');
+  return value.replace(/,\s*([}\]])/g, '$1');
 }
 
+function diagnoseJsonError(value: string, error: unknown): string {
+  const trimmed = value.trim();
+
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{' || char === '[') {
+      stack.push(char);
+      continue;
+    }
+
+    if (char === '}' || char === ']') {
+      const open = stack.pop();
+      const matched =
+        (open === '{' && char === '}') ||
+        (open === '[' && char === ']');
+
+      if (!matched) {
+        return `JSON 括号不匹配，约在字符 ${index + 1} 附近。`;
+      }
+    }
+  }
+
+  if (inString) {
+    return 'JSON 中存在未闭合的英文双引号字符串，请检查复制内容是否完整。';
+  }
+
+  if (stack.length > 0 || !trimmed.endsWith('}')) {
+    return 'JSON 没有完整结束，可能在复制或生成过程中被截断。';
+  }
+
+  const message = error instanceof Error ? error.message : '';
+  const position = message.match(/position\s+(\d+)/i);
+
+  if (position) {
+    return `JSON 语法错误，约在字符 ${Number(position[1]) + 1} 附近：${message}`;
+  }
+
+  return message
+    ? `JSON 语法错误：${message}`
+    : 'JSON 存在无法自动修复的语法错误。';
+}
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -216,19 +276,30 @@ export function parseReportImport(raw: string): ImportPreview {
   if (!raw.trim()) throw new Error('请粘贴 JSON，或上传 JSON/TXT 文件');
   if (raw.length > MAX_PAYLOAD_LENGTH) throw new Error('导入内容超过 250 KB 限制');
 
-  let input: Record<string, unknown>;
-  const jsonPayload = extractJsonPayload(raw);
-  try {
-    input = JSON.parse(jsonPayload);
-  } catch {
+  let parsed: unknown;
+const jsonPayload = extractJsonPayload(raw);
+
+try {
+  parsed = JSON.parse(jsonPayload);
+} catch (firstError) {
+  const normalized = normalizeJsonText(jsonPayload);
+
+  if (normalized !== jsonPayload) {
     try {
-      input = JSON.parse(normalizeJsonText(jsonPayload));
-    } catch {
-      throw new Error('JSON 内容不完整或引号未闭合。请让 AI 重新生成完整日报；普通字段偏差可自动修复，但被截断的内容无法恢复。');
+      parsed = JSON.parse(normalized);
+    } catch (secondError) {
+      throw new Error(diagnoseJsonError(normalized, secondError));
     }
+  } else {
+    throw new Error(diagnoseJsonError(jsonPayload, firstError));
   }
-  if (!isObject(input)) throw new Error('导入内容必须是一个 JSON 对象');
-  input = normalizeReportShape(input);
+}
+
+if (!isObject(parsed)) {
+  throw new Error('导入内容必须是一个 JSON 对象');
+}
+
+let input = normalizeReportShape(parsed);
   if (input.schema_version !== 'LINGOTRACE_REPORT_V1') {
     throw new Error('schema_version 必须是 LINGOTRACE_REPORT_V1');
   }
@@ -242,6 +313,21 @@ export function parseReportImport(raw: string): ImportPreview {
   const scores = Object.fromEntries(
     scoreNames.map(name => [name, numberInRange(input.scores[name], `scores.${name}`, 0, 10)])
   ) as Record<ScoreName, number>;
+  const expectedOverall = Number((
+  (
+    scores.fluency +
+    scores.grammar +
+    scores.vocabulary +
+    scores.naturalness +
+    scores.communication
+  ) / 5
+).toFixed(1));
+
+if (Math.abs(scores.overall - expectedOverall) > 0.0001) {
+  throw new Error(
+    `scores.overall 应为五项平均值 ${expectedOverall}，当前为 ${scores.overall}`
+  );
+}
 
   const topics = list(input.topics, 'topics').map((item, index) => requiredText(item, `topics[${index}]`, 200));
   const strengths = list(input.strengths, 'strengths').map((item, index) => requiredText(item, `strengths[${index}]`));
@@ -276,7 +362,15 @@ export function parseReportImport(raw: string): ImportPreview {
       ),
     };
   });
-  const sentences = list(input.sentences, 'sentences').map((item, index) => {
+  const sentenceItems = list(input.sentences, 'sentences');
+
+if (sentenceItems.length !== 10) {
+  throw new Error(
+    `sentences 必须恰好包含 10 条，当前为 ${sentenceItems.length} 条`
+  );
+}
+
+const sentences = sentenceItems.map((item, index) => {
     if (!isObject(item)) throw new Error(`sentences[${index}] 必须是对象`);
     const category = item.category ?? 'daily';
     if (!sentenceCategories.includes(String(category))) throw new Error(`sentences[${index}].category 无效`);
